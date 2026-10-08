@@ -1,0 +1,68 @@
+name: サイト記事をXへ予約投稿（Buffer）
+
+# 履歴ファイル（data/posted_history.json）をコミットするため書き込み権限が必要
+permissions:
+  contents: write
+
+on:
+  # 手動実行：初回は dry_run=true（既定）で投稿内容だけ確認すること
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '確認のみ（Bufferに投稿しない）'
+        required: false
+        default: true
+        type: boolean
+      daily_post_limit:
+        description: '1日の投稿上限（空欄で Variables の DAILY_POST_LIMIT、無ければ3）'
+        required: false
+        default: ''
+        type: string
+
+  # 毎日 日本時間 06:30 に、その日の分（7-9時 / 12-13時 / 19-23時の枠内ランダム時刻）を予約する。
+  # cron は UTC 基準：21:30 UTC = 翌日 06:30 JST
+  schedule:
+    - cron: '30 21 * * *'
+
+# 二重起動による重複予約を防ぐ
+concurrency:
+  group: site-x-post
+  cancel-in-progress: false
+
+jobs:
+  schedule-posts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Pythonのセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 依存ライブラリのインストール
+        run: pip install -r requirements.txt
+
+      - name: 記事を取得してBufferに予約投稿
+        env:
+          BUFFER_API_KEY:    ${{ secrets.BUFFER_API_KEY }}
+          BUFFER_CHANNEL_ID: ${{ secrets.BUFFER_CHANNEL_ID }}
+          SITE_URL:          ${{ vars.SITE_URL || 'https://adult-navi19.com' }}
+          # 手動実行はinputsの値、定期実行は Variables の DRY_RUN（未設定なら本番）を使う
+          DRY_RUN:           ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.dry_run) || (vars.DRY_RUN || 'false') }}
+          DAILY_POST_LIMIT:  ${{ inputs.daily_post_limit || vars.DAILY_POST_LIMIT || '3' }}
+          POST_WINDOWS:      ${{ vars.POST_WINDOWS || '' }}
+          RECYCLE_AFTER_DAYS: ${{ vars.RECYCLE_AFTER_DAYS || '30' }}
+        run: python site_x_poster.py
+
+      - name: 履歴をコミット
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --staged --quiet || (git commit -m "🤖 投稿履歴を更新 ($(date -u +'%Y-%m-%d %H:%M'))" && git push)
