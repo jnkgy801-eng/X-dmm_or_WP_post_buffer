@@ -1,0 +1,21 @@
+{
+  "targets": [
+    {
+      "site": "FANZA",
+      "service": "doujin",
+      "floor": "digital_doujin",
+      "genre_keywords": ["寝取", "NTR"],
+      "pages": 2,
+      "sort": "date"
+    }
+  ],
+  "ending_keywords": {
+    "revenge-back": ["寝取り返"],
+    "zamaa": ["ざまぁ", "ザマァ", "復讐"],
+    "happy-end": ["ハッピーエンド"]
+  },
+  "exclude_genre_keywords": ["ロリ", "ショタ"],
+  "min_reviews": 3,
+  "max_items": 150,
+  "import_unclassified": true
+}
