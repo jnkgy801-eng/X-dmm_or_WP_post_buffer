@@ -10,6 +10,7 @@ Geminiは使わない。結末(寝取り返し/ざまぁ/ハッピーエンド)�
   python navi_sync.py --list-floors              # フロア一覧(service/floorのコード確認)
   python navi_sync.py --list-genres <floor_id>   # そのフロアのジャンル(タグ)一覧
   python navi_sync.py --dry-run                  # 取得だけして送らない(最初はこれで確認)
+  python navi_sync.py --dump-raw                 # APIが返す作品1件の生データを表示(取れる項目の確認)
   python navi_sync.py                            # 取得してWordPressへ登録
 """
 import argparse
@@ -128,21 +129,28 @@ def classify(genres, title, rules):
     return best
 
 
-def normalize(it, rules, target_names, exclude):
+def is_excluded(it, exclude):
+    """除外キーワードがタグまたはタイトルに含まれる作品か"""
+    title = str(it.get("title") or "")
+    genres = [str(g.get("name", "")) for g in ((it.get("iteminfo") or {}).get("genre") or [])]
+    return any(k in g for g in genres for k in exclude) or any(k in title for k in exclude)
+
+
+def normalize(it, rules, target_names, exclude, trait_whitelist=()):
     cid = str(it.get("content_id") or it.get("product_id") or "")
     title = str(it.get("title") or "").strip()
     aff = it.get("affiliateURL") or it.get("URL") or ""
     if not (cid and title and aff):
         return None
     genres = [str(g.get("name", "")) for g in ((it.get("iteminfo") or {}).get("genre") or [])]
-    if any(k in g for g in genres for k in exclude):
+    if is_excluded(it, exclude):
         return None
     prices = it.get("prices") or {}
     img = it.get("imageURL") or {}
     review = it.get("review") or {}
     rcount = to_int(review.get("count"))
     ending, conf, why = classify(genres, title, rules)
-    traits = [g for g in genres if g and g not in target_names and len(g) <= 20][:6]
+    traits = [g for g in genres if g in trait_whitelist][:6]  # 許可リストにある属性だけ付ける
     note = "タグ: %s / レビュー %s(%d件) / %s" % (", ".join(genres[:10]), review.get("average") or "-", rcount, why)
     return {
         "review_count": rcount,
@@ -183,6 +191,7 @@ def main(argv=None):
     ap.add_argument("--list-floors", action="store_true")
     ap.add_argument("--list-genres", metavar="FLOOR_ID")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--dump-raw", action="store_true", help="APIが返す作品1件の生データを表示して終了(取れる項目の確認用)")
     args = ap.parse_args(argv)
 
     api = Api(env("DMM_API_ID"), env("DMM_AFFILIATE_ID"))
@@ -200,6 +209,7 @@ def main(argv=None):
     exclude = cfg.get("exclude_genre_keywords", [])
     min_reviews = int(cfg.get("min_reviews", 0))
     keep_other = bool(cfg.get("import_unclassified", True))
+    whitelist = set(cfg.get("trait_whitelist", []))
 
     found = {}
     for t in cfg["targets"]:
@@ -214,7 +224,12 @@ def main(argv=None):
         names = [n for _, n in chosen]
         for gid, _ in chosen:
             for it in fetch_items(api, t, gid):
-                n = normalize(it, rules, names, exclude)
+                if args.dump_raw:
+                    if is_excluded(it, exclude):
+                        continue
+                    print(json.dumps(it, ensure_ascii=False, indent=2))
+                    return
+                n = normalize(it, rules, names, exclude, whitelist)
                 if not n or n["review_count"] < min_reviews:
                     continue
                 if n["ending"] == "other" and not keep_other:
