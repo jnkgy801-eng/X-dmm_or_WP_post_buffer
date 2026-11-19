@@ -54,17 +54,29 @@ def new_stat():
             "rev_n": 0, "rev_sum": 0.0, "top": (-1, ""), "wl": []}
 
 
-def actress_image(api, aid):
-    """ActressSearch APIで女優の写真URLを取る(なければ空文字)"""
+def actress_profile(api, aid):
+    """ActressSearch APIで、女優の写真URLとプロフィール(身長・カップ・3サイズ)を取る。
+    取れなかった項目は含めない(体重はAPIに無いので取らない)。"""
     try:
         res = api.get("ActressSearch", actress_id=aid, hits=1)
-    except Exception as e:  # 写真が取れなくても全体は止めない
-        print("photo skipped (%s): %s" % (aid, e))
-        return ""
+    except Exception as e:  # 取れなくても全体は止めない
+        print("profile skipped (%s): %s" % (aid, e))
+        return {}
     for a in res.get("actress") or []:
         img = a.get("imageURL") or {}
-        return (img.get("large") or img.get("small") or "").replace("http://", "https://")
-    return ""
+        out = {}
+        photo = (img.get("large") or img.get("small") or "").replace("http://", "https://")
+        if photo:
+            out["image"] = photo
+        for k in ("height", "bust", "waist", "hip"):
+            v = ns.to_int(a.get(k))
+            if v > 0:
+                out[k] = v
+        cup = str(a.get("cup") or "").strip()
+        if cup:
+            out["cup"] = cup
+        return out
+    return {}
 
 
 def push_actresses(site, token, period, items):
@@ -89,7 +101,7 @@ def main(argv=None):
     ap.add_argument("--push", action="store_true", help="集計結果をWordPressの女優ページに送る")
     ap.add_argument("--push-min-solo", type=int, default=5, help="送る女優の最低単体作品数")
     ap.add_argument("--max-push", type=int, default=150, help="送る女優の最大人数")
-    ap.add_argument("--no-photos", action="store_true", help="女優の写真を取得しない(速くなる)")
+    ap.add_argument("--no-photos", action="store_true", help="女優の写真・プロフィールを取得しない(速くなる)")
     args = ap.parse_args(argv)
 
     api = ns.Api(ns.env("DMM_API_ID"), ns.env("DMM_AFFILIATE_ID"))
@@ -200,7 +212,7 @@ def main(argv=None):
     if args.push:
         if not args.no_photos:
             for x in payload:
-                x["image"] = actress_image(api, x["aid"])
+                x.update(actress_profile(api, x["aid"]))
         push_actresses(ns.env("NAVI_SITE_URL"), ns.env("NAVI_API_TOKEN"), args.months, payload)
         print("pushed: %d actresses" % len(payload))
 
