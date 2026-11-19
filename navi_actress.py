@@ -49,6 +49,31 @@ def fetch_pages(api, t, pages, cutoff):
             return
 
 
+def price_range(it):
+    """配信タイプ別の価格から、最安〜最高を返す(取れなければ price を使う)"""
+    prices = it.get("prices") or {}
+    ds = (prices.get("deliveries") or {}).get("delivery") or []
+    if isinstance(ds, dict):
+        ds = [ds]
+    vals = [ns.to_int(d.get("price")) for d in ds if isinstance(d, dict)]
+    vals = [v for v in vals if v > 0]
+    if not vals:
+        v = ns.to_int(prices.get("price"))
+        vals = [v] if v > 0 else []
+    return (min(vals), max(vals)) if vals else (0, 0)
+
+
+def sample_info(it):
+    """サンプル画像(最大4枚)とサンプル動画のURL"""
+    imgs = (((it.get("sampleImageURL") or {}).get("sample_s") or {}).get("image")) or []
+    if isinstance(imgs, str):
+        imgs = [imgs]
+    samples = [u.replace("http://", "https://") for u in imgs[:4] if isinstance(u, str)]
+    sm = it.get("sampleMovieURL") or {}
+    movie = sm.get("size_644_414") or sm.get("size_560_360") or sm.get("size_476_306") or ""
+    return samples, str(movie).replace("http://", "https://")
+
+
 def new_stat():
     return {"name": "", "ruby": "", "works": 0, "recent": 0, "solo": 0, "aggr": 0, "wife": 0,
             "rev_n": 0, "rev_sum": 0.0, "top": (-1, ""), "wl": []}
@@ -154,6 +179,12 @@ def main(argv=None):
             "solo": SOLO_ID in gids,
             "rc": rc,
             "avg": avg,
+            "minutes": ns.to_int(it.get("volume")),
+            "price_min": price_range(it)[0],
+            "price_max": price_range(it)[1],
+            "maker": str(((info.get("maker") or [{}])[0] or {}).get("name") or ""),
+            "samples": sample_info(it)[0],
+            "movie": sample_info(it)[1],
         }
         used += 1
         for a in actresses:
