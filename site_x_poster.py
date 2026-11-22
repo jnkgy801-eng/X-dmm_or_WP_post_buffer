@@ -1,8 +1,11 @@
 """
-自サイト（WordPress）の記事 → X（Buffer経由）予約投稿スクリプト
+NTRサイト（WordPress）の index 対象ページ → X（Buffer経由）予約投稿スクリプト
+
+投稿するのは、サイトが /wp-json/navi/v1/feed で公開している「検索に載せてよいページ」だけ
+（データが十分な女優ページ・新作／高評価／セール／シチュエーション別の集計ページ）。
 
 流れ:
-  1. WordPress REST API（失敗時はRSS）から最新記事を取得
+  1. サイトのフィード（/wp-json/navi/v1/feed）から投稿候補を取得
   2. 履歴（data/posted_history.json）と安全フィルタで投稿候補を絞り込む
   3. 1日の上限・時間帯・ランダムなゆらぎを考慮して予約時刻を決める
   4. Bufferに「本文（リンクなし）→ リプライ（リンク）」のスレッドとして予約作成
@@ -19,7 +22,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import email.utils
 import html
 import json
 import os
@@ -27,7 +29,6 @@ import random
 import re
 import sys
 import time
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -60,29 +61,28 @@ DEFAULT_NG_WORDS: list[str] = [
     "性器", "デカチン", "巨根",
 ]
 
-# サイトのタグ名 → 投稿用ハッシュタグ（ここに無いタグは使わない＝露骨なタグを自動除外）
+# フィードのタグ名（シチュエーション名） → 投稿用ハッシュタグ（ここに無いものは使わない）
 SAFE_HASHTAG_MAP: dict[str, str] = {
-    "巨乳": "巨乳", "おっぱい": "おっぱい", "制服": "制服", "人妻・主婦": "人妻", "熟女": "熟女",
-    "ギャル": "ギャル", "ハーレム": "ハーレム", "純愛": "純愛", "ダウナー": "ダウナー",
-    "ラブラブ・あまあま": "あまあま", "寝取り・寝取られ・NTR": "NTR", "KU100": "KU100", "ASMR": "ASMR",
+    "人妻・不倫": "人妻", "彼女・恋人": "彼女", "職場・上司": "職場", "隣人・ご近所": "隣人", "VR": "VR",
 }
 
-# 冒頭の一言テンプレート。{tag} はタグ名（タグが取れない記事では tag 不要のものだけ使う）
-HOOKS_PLAIN: list[str] = [
-    "新着作品を追加しました📥",
-    "本日の新着から1本👀",
-    "今日のピックアップ✨",
-    "新作チェック📝",
-    "サイトを更新しました🆕",
+# 冒頭の一言テンプレート。事実だけを述べ、体験談は作らない。{tag} はタグ名
+HOOKS_ACTRESS: list[str] = [
+    "NTRタグ作品の出演数で選ぶなら👀",
+    "NTR作品が多い女優をまとめています📝",
+    "NTRの出演作から選ぶ女優ガイド👀",
+    "出演作数・レビューで探せる女優ページ📊",
+]
+HOOKS_LIST: list[str] = [
+    "NTR作品の一覧を更新しました🆕",
+    "新作・ランキングをチェック📥",
+    "最新のNTR情報をまとめました📝",
+    "今週のチェックリスト✨",
 ]
 HOOKS_WITH_TAG: list[str] = [
-    "{tag}が好きな人はチェック👀",
-    "{tag}系の新着です📥",
-    "{tag}好きに向けた新作を紹介しています✨",
-]
-HOOKS_AUDIO: list[str] = [  # KU100（バイノーラル録音）タグの記事向け
-    "KU100収録の新作です🎧 イヤホン推奨",
-    "ヘッドホンで聴きたい新作が入りました🎧",
+    "{tag}系が好きな人はチェック👀",
+    "{tag}もののまとめです📥",
+    "{tag}好きに向けた一覧です✨",
 ]
 REPLY_LEADS: list[str] = [
     "詳細・サンプルはこちら👇",
@@ -153,7 +153,7 @@ class Config:
     @classmethod
     def from_env(cls) -> "Config":
         return cls(
-            site_url=_env_str("SITE_URL", "https://adult-navi19.com").rstrip("/"),
+            site_url=_env_str("SITE_URL", "https://adult-navi21.site").rstrip("/"),
             buffer_api_key=_env_str("BUFFER_API_KEY"),
             buffer_channel_id=_env_str("BUFFER_CHANNEL_ID"),
             dry_run=_env_bool("DRY_RUN", True),  # 安全側：明示的に false にしない限り実投稿しない
@@ -164,7 +164,7 @@ class Config:
             recycle_after_days=max(0, _env_int("RECYCLE_AFTER_DAYS", 30)),
             max_title_chars=max(8, _env_int("MAX_TITLE_CHARS", 28)),
             max_masks=max(0, _env_int("MAX_TITLE_MASKS", 2)),
-            base_hashtag=_env_str("BASE_HASHTAG", "FANZA同人").lstrip("#"),
+            base_hashtag=_env_str("BASE_HASHTAG", "NTR").lstrip("#"),
             ad_tag=_env_str("AD_TAG", "#PR"),
             url_in_reply=_env_bool("URL_IN_REPLY", True),
             skip_url_check=_env_bool("SKIP_URL_CHECK", False),
@@ -174,7 +174,7 @@ class Config:
 
 
 # ================================================================
-# 記事の取得（WordPress REST API → 失敗時 RSS）
+# 候補の取得（サイトのフィード）
 # ================================================================
 
 
@@ -185,6 +185,8 @@ class Post:
     url: str
     tags: list[str]
     published: dt.datetime  # UTC
+    kind: str = "list"  # actress | list
+    blurb: str = ""  # 件数など事実だけの一行
 
 
 def _strip_html(text: str) -> str:
@@ -195,84 +197,38 @@ def _make_key(url: str) -> str:
     return urlparse(url).path or url
 
 
-def _fetch_tag_names(session: requests.Session, cfg: Config, tag_ids: set[int]) -> dict[int, str]:
-    names: dict[int, str] = {}
-    ids = sorted(tag_ids)
-    for i in range(0, len(ids), 100):
-        chunk = ids[i : i + 100]
-        resp = session.get(
-            f"{cfg.site_url}/wp-json/wp/v2/tags",
-            params={"include": ",".join(map(str, chunk)), "per_page": 100, "_fields": "id,name"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        names.update({t["id"]: html.unescape(t["name"]) for t in resp.json()})
-    return names
-
-
-def fetch_posts_rest(session: requests.Session, cfg: Config, limit: int = 60) -> list[Post]:
-    resp = session.get(
-        f"{cfg.site_url}/wp-json/wp/v2/posts",
-        params={"per_page": limit, "orderby": "date", "order": "desc", "_fields": "id,date_gmt,link,title,tags"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    items: list[dict[str, Any]] = resp.json()
-    tag_names = _fetch_tag_names(session, cfg, {t for it in items for t in it.get("tags", [])})
-    posts: list[Post] = []
-    for it in items:
-        published = dt.datetime.fromisoformat(it["date_gmt"]).replace(tzinfo=dt.timezone.utc)
-        posts.append(
-            Post(
-                key=_make_key(it["link"]),
-                title=_strip_html(it["title"]["rendered"]),
-                url=it["link"],
-                tags=[tag_names[t] for t in it.get("tags", []) if t in tag_names],
-                published=published,
-            )
-        )
-    return posts
-
-
 def fetch_posts_feed(session: requests.Session, cfg: Config) -> list[Post]:
-    resp = session.get(f"{cfg.site_url}/feed/", timeout=30)
+    """サイトのフィードから、indexしてよいページだけを取得する。"""
+    resp = session.get(f"{cfg.site_url}/wp-json/navi/v1/feed", timeout=30)
     resp.raise_for_status()
-    root = ET.fromstring(resp.content)
     posts: list[Post] = []
-    for item in root.iter("item"):
-        link = (item.findtext("link") or "").strip()
-        if not link:
-            continue
-        pub_raw = item.findtext("pubDate")
-        published = email.utils.parsedate_to_datetime(pub_raw).astimezone(dt.timezone.utc) if pub_raw else dt.datetime.now(dt.timezone.utc)
+    for it in resp.json():
+        published = dt.datetime.fromisoformat(it["published"].replace("Z", "+00:00"))
         posts.append(
             Post(
-                key=_make_key(link),
-                title=_strip_html(item.findtext("title") or ""),
-                url=link,
-                tags=[(c.text or "").strip() for c in item.findall("category") if c.text],
+                key=_make_key(it["url"]),
+                title=_strip_html(it["title"]),
+                url=it["url"],
+                tags=list(it.get("tags", [])),
                 published=published,
+                kind=it.get("kind", "list"),
+                blurb=_strip_html(it.get("blurb", "")),
             )
         )
     return posts
 
 
 def load_posts(session: requests.Session, cfg: Config) -> list[Post]:
-    """記事を新しい順に返す。テスト用に POSTS_FIXTURE（JSONファイル）も読める。"""
+    """候補を新しい順に返す。テスト用に POSTS_FIXTURE（JSONファイル）も読める。"""
     if cfg.posts_fixture:
         raw = json.loads(Path(cfg.posts_fixture).read_text(encoding="utf-8"))
         return [
             Post(key=_make_key(r["url"]), title=r["title"], url=r["url"], tags=r.get("tags", []),
-                 published=dt.datetime.fromisoformat(r["published"]))
+                 published=dt.datetime.fromisoformat(r["published"]), kind=r.get("kind", "list"), blurb=r.get("blurb", ""))
             for r in raw
         ]
-    try:
-        posts = fetch_posts_rest(session, cfg)
-        print(f"📥 REST APIから {len(posts)} 件取得")
-    except (requests.RequestException, ValueError, KeyError) as e:
-        print(f"⚠️  REST API取得に失敗（{e}）。RSSにフォールバックします。")
-        posts = fetch_posts_feed(session, cfg)
-        print(f"📥 RSSから {len(posts)} 件取得")
+    posts = fetch_posts_feed(session, cfg)
+    print(f"📥 フィードから {len(posts)} 件取得")
     return sorted(posts, key=lambda p: p.published, reverse=True)
 
 
@@ -368,11 +324,9 @@ def build_hashtags(post: Post, cfg: Config, rng: random.Random) -> tuple[str, Op
 
 def choose_hook(post: Post, tag_label: Optional[str], recent: list[str], rng: random.Random) -> str:
     """直近3回と同じ文面を避けて冒頭の一言を選ぶ。"""
-    pool = list(HOOKS_PLAIN)
+    pool = list(HOOKS_ACTRESS if post.kind == "actress" else HOOKS_LIST)
     if tag_label:
         pool += [h.format(tag=tag_label) for h in HOOKS_WITH_TAG]
-    if "KU100" in post.tags or "KU100" in post.title:
-        pool += HOOKS_AUDIO * 2  # 事実に基づく訴求なので出現率を上げる
     fresh = [h for h in pool if h not in recent[-3:]] or pool
     return rng.choice(fresh)
 
@@ -400,9 +354,9 @@ def build_texts(post: Post, cfg: Config, ng_words: list[str], history: History, 
 
     def assemble(t: str) -> tuple[str, Optional[str]]:
         if cfg.url_in_reply:
-            main = f"{hook}\n\n📽 {t}\n\n{tag_line}".strip()
+            main = f"{hook}\n\n📌 {t}\n{post.blurb}\n\n{tag_line}".replace("\n\n\n", "\n\n").strip()
             return main, f"{lead}\n{post.url}\n{cfg.ad_tag}"
-        return f"{hook}\n\n📽 {t}\n\n{post.url}\n\n{tag_line} {cfg.ad_tag}".strip(), None
+        return f"{hook}\n\n📌 {t}\n{post.blurb}\n\n{post.url}\n\n{tag_line} {cfg.ad_tag}".strip(), None
 
     for limit in (len(title), 20, 14, 10):  # 長すぎるときはタイトルをさらに縮める
         shown = title if limit >= len(title) else title[: limit - 1] + "…"
@@ -529,8 +483,8 @@ def main() -> int:
 
     try:
         posts = load_posts(session, cfg)
-    except (requests.RequestException, ET.ParseError, OSError, ValueError, KeyError) as e:
-        print(f"❌ 記事の取得に失敗しました: {e}")
+    except (requests.RequestException, OSError, ValueError, KeyError) as e:
+        print(f"❌ 候補の取得に失敗しました: {e}")
         return 2
 
     # 今日の残り枠 → 無ければ翌日の枠に予約する（1日の上限は予約日基準で数える）
@@ -546,7 +500,7 @@ def main() -> int:
         return 0
 
     mode = "DRY RUN（投稿しません）" if cfg.dry_run else "本番（Bufferに予約作成）"
-    print(f"🐦 {mode} / 予約枠 {len(slots)} 件 / 記事 {len(posts)} 件")
+    print(f"🐦 {mode} / 予約枠 {len(slots)} 件 / 候補 {len(posts)} 件")
 
     errors = consecutive_errors = done = 0
     summary: list[str] = []
