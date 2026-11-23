@@ -2,7 +2,7 @@
 """FANZA動画のNTRタグ作品を取得し、サイト(WordPress / プラグイン navi-happyend-hub)へ登録する。
 
 1回の取得(NTRジャンルの新着順)から、次の2つを作って送る。
-  - 作品  : 新作・高評価・セール・シチュエーション別ページの元データ (POST /navi/v1/upsert)
+  - 作品  : 新作・高評価・セール・シチュエーション別ページの元データ (POST /navi/v1/works-upsert)
   - 女優  : NTR作品数・単体作品数・レビュー・得意なシチュエーション (POST /navi/v1/actress-upsert)
 
 シチュエーション分類は、FANZAのタグ名とタイトルの語句一致による目安(navi_config.json の situations)。
@@ -332,7 +332,7 @@ def main(argv=None):
         return
 
     site, token = env("NAVI_SITE_URL"), env("NAVI_API_TOKEN")
-    post(site, token, "upsert", "items", sends, 50)
+    post(site, token, "works-upsert", "items", sends, 50)
     if not args.no_photos:
         for a in actresses:
             a.update(actress_profile(api, a["aid"]))
