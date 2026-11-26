@@ -2,7 +2,9 @@ name: navi-sync（FANZAのNTR作品・女優をサイトへ登録）
 
 on:
   schedule:
-    - cron: "0 20 * * *"   # 毎日 日本時間 5:00
+    # 毎時0分ちょうどはGitHub側が混み合い、実行が遅れたり落とされたりしやすいので、分をずらしている
+    - cron: "17 20 * * *"   # 毎日 日本時間 5:17（本命）
+    - cron: "47 23 * * *"   # 毎日 日本時間 8:47（本命が落とされた時だけ動く保険。成功済みならスキップ）
   workflow_dispatch:
     inputs:
       dry_run:
@@ -10,6 +12,10 @@ on:
         required: false
         default: false
         type: boolean
+
+permissions:
+  contents: read
+  actions: read   # 直近の成功実行を調べるため
 
 concurrency:
   group: navi-sync
@@ -20,21 +26,40 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # 保険の実行が、本命の成功後に二重で動かないようにする（定期実行のときだけ判定）。
+      # 窓を6時間にしているのは、本命と保険の間隔(約3.5時間)より長く、翌日の本命(約20.5時間後)より短くするため
+      - name: 直近6時間に定期実行が成功していればスキップ
+        id: guard
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          since=$(date -u -d '6 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          count=$(gh api -X GET "repos/${GITHUB_REPOSITORY}/actions/workflows/navi-sync.yml/runs" \
+            -f event=schedule -f status=success -f created=">=${since}" --jq '.total_count')
+          echo "直近6時間の成功実行: ${count}件"
+          if [ "${count}" -gt 0 ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
+
       - uses: actions/checkout@v4
+        if: steps.guard.outputs.skip != 'true'
       - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip != 'true'
         with:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
+        if: steps.guard.outputs.skip != 'true'
       - run: python navi_ntr.py ${{ inputs.dry_run && '--dry-run' || '' }} --csv actress_stats.csv
+        if: steps.guard.outputs.skip != 'true'
         env:
           DMM_API_ID: ${{ secrets.DMM_API_ID }}
           DMM_AFFILIATE_ID: ${{ secrets.DMM_AFFILIATE_ID }}
           NAVI_SITE_URL: https://adult-navi21.site
           NAVI_API_TOKEN: ${{ secrets.NAVI_API_TOKEN }}
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.guard.outputs.skip != 'true'
         with:
           name: actress_stats
           path: actress_stats.csv
           retention-days: 7
+          if-no-files-found: ignore
