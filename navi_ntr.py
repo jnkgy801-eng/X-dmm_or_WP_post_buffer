@@ -13,7 +13,11 @@
   python navi_ntr.py                        # 取得して送る
   python navi_ntr.py --list-genres          # videoaフロアのジャンル(タグ)一覧
   python navi_ntr.py --csv actress.csv      # 女優別の集計をCSVにも出す(Excelで開ける)
+
+終了コード: 0=成功 / 1=失敗(0件取得・API/サイトのエラー等)。失敗時はGitHub Actionsが赤くなり通知される。
 """
+from __future__ import annotations
+
 import argparse
 import csv
 import json
@@ -22,31 +26,63 @@ import re
 import sys
 import time
 from collections import Counter, defaultdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Iterator
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 API = "https://api.dmm.com/affiliate/v3"
-UA = "navi-ntr/1.0"
+UA = "navi-ntr/1.1"
+JST = timezone(timedelta(hours=9))
 AGGRESSIVE_IDS = {1031, 4120}  # 痴女, 逆ナン
 WIFE_IDS = {1039, 1020, 1069}  # 人妻・主婦, 若妻・幼妻, 不倫
 SOLO_ID = 4025                 # 単体作品
 
+Json = dict[str, Any]
 
-def env(name, required=True):
+
+def today_jst() -> date:
+    """日本時間の今日。
+
+    GitHub ActionsはUTCで動くため date.today() だと日本の発売日が1日遅れて反映される
+    (日本時間5時の実行 = UTCではまだ前日)。
+    """
+    return datetime.now(JST).date()
+
+
+def env(name: str, required: bool = True) -> str:
     v = os.environ.get(name, "").strip()
     if required and not v:
         sys.exit("環境変数 %s が未設定です" % name)
     return v
 
 
-class Api:
-    def __init__(self, api_id, affiliate_id):
-        self.base = {"api_id": api_id, "affiliate_id": affiliate_id, "output": "json"}
-        self.session = requests.Session()
-        self.session.headers["User-Agent"] = UA
+def make_session() -> requests.Session:
+    """一時的な障害(429 / 5xx / 接続断)で毎日の更新が止まらないよう、自動リトライ付きにする。
 
-    def get(self, path, **params):
+    POSTもリトライ対象にしているのは、サイト側の登録(upsert)が同じデータを何度送っても結果が同じ(冪等)なため。
+    """
+    retry = Retry(
+        total=4, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST"}), respect_retry_after_header=True,
+        raise_on_status=False,  # 使い切った時はRetryErrorではなく最後のレスポンスを返す(原因が分かるエラーになる)
+    )
+    s = requests.Session()
+    s.headers["User-Agent"] = UA
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+class Api:
+    def __init__(self, api_id: str, affiliate_id: str) -> None:
+        self.base = {"api_id": api_id, "affiliate_id": affiliate_id, "output": "json"}
+        self.session = make_session()
+
+    def get(self, path: str, **params: Any) -> Json:
         time.sleep(1.0)  # APIに優しく
         r = self.session.get("%s/%s" % (API, path), params={**self.base, **params}, timeout=30)
         r.raise_for_status()
@@ -56,22 +92,22 @@ class Api:
         return res
 
 
-def to_int(v):
+def to_int(v: Any) -> int:
     m = re.search(r"\d[\d,]*", str(v if v is not None else ""))
     return int(m.group(0).replace(",", "")) if m else 0
 
 
-def genre_names(it):
+def genre_names(it: Json) -> list[str]:
     return [str(g.get("name", "")) for g in ((it.get("iteminfo") or {}).get("genre") or [])]
 
 
-def is_excluded(it, keywords):
+def is_excluded(it: Json, keywords: list[str]) -> bool:
     """除外キーワードが、タグまたはタイトルに含まれる作品か"""
     title = str(it.get("title") or "")
     return any(k in g for g in genre_names(it) for k in keywords) or any(k in title for k in keywords)
 
 
-def situations_of(genres, title, rules):
+def situations_of(genres: list[str], title: str, rules: dict[str, Json]) -> list[str]:
     out = []
     for key, r in rules.items():
         if any(g in genres for g in r.get("genres", [])) or any(k in title for k in r.get("title", [])):
@@ -79,8 +115,8 @@ def situations_of(genres, title, rules):
     return out
 
 
-def sale_end_of(it):
-    today = date.today().isoformat()
+def sale_end_of(it: Json) -> str:
+    today = today_jst().isoformat()
     for c in it.get("campaign") or []:
         end = str(c.get("date_end") or "")[:10]
         if re.match(r"^\d{4}-\d{2}-\d{2}$", end) and end >= today:
@@ -88,7 +124,7 @@ def sale_end_of(it):
     return ""
 
 
-def price_range(it):
+def price_range(it: Json) -> tuple[int, int]:
     """配信タイプ別の価格から、最安〜最高を返す(取れなければ price を使う)"""
     prices = it.get("prices") or {}
     ds = (prices.get("deliveries") or {}).get("delivery") or []
@@ -102,7 +138,7 @@ def price_range(it):
     return (min(vals), max(vals)) if vals else (0, 0)
 
 
-def sample_info(it):
+def sample_info(it: Json) -> tuple[list[str], str]:
     """サンプル画像(最大4枚)とサンプル動画ページのURL"""
     imgs = (((it.get("sampleImageURL") or {}).get("sample_s") or {}).get("image")) or []
     if isinstance(imgs, str):
@@ -113,7 +149,7 @@ def sample_info(it):
     return samples, str(movie).replace("http://", "https://")
 
 
-def fetch_items(api, cfg, cutoff, pages):
+def fetch_items(api: Api, cfg: Json, cutoff: str, pages: int) -> Iterator[Json]:
     for p in range(pages):
         res = api.get(
             "ItemList", site=cfg.get("site", "FANZA"), service=cfg["service"], floor=cfg["floor"],
@@ -128,18 +164,21 @@ def fetch_items(api, cfg, cutoff, pages):
             return
 
 
-def build(api, cfg, pages):
+def build(api: Api, cfg: Json, pages: int) -> tuple[list[Json], dict[str, Json], Counter[str]]:
     """取得した作品を、作品リストと女優別の集計にまとめる"""
-    today = date.today().isoformat()
-    cutoff = (date.today() - timedelta(days=30 * cfg["months"])).isoformat()
-    year_ago = (date.today() - timedelta(days=365)).isoformat()
-    exclude = cfg.get("exclude_keywords", [])
-    rules = cfg.get("situations", {})
+    today_d = today_jst()
+    today = today_d.isoformat()
+    cutoff = (today_d - timedelta(days=30 * cfg["months"])).isoformat()
+    year_ago = (today_d - timedelta(days=365)).isoformat()
+    exclude: list[str] = cfg.get("exclude_keywords", [])
+    rules: dict[str, Json] = cfg.get("situations", {})
 
-    works, stats, seen = [], defaultdict(lambda: {
+    works: list[Json] = []
+    stats: dict[str, Json] = defaultdict(lambda: {
         "name": "", "ruby": "", "works": 0, "recent": 0, "solo": 0, "aggr": 0, "wife": 0, "rev_n": 0,
-        "rev_sum": 0.0, "top": (-1, ""), "latest": "", "sits": Counter(), "wl": []}), set()
-    skipped = Counter()
+        "rev_sum": 0.0, "top": (-1, ""), "latest": "", "sits": Counter(), "wl": []})
+    seen: set[str] = set()
+    skipped: Counter[str] = Counter()
     for it in fetch_items(api, cfg, cutoff, pages):
         cid = str(it.get("content_id") or "")
         if not cid or cid in seen:
@@ -159,7 +198,7 @@ def build(api, cfg, pages):
         if not (actresses and aff and title):
             skipped["incomplete"] += 1
             continue
-        gids = set()
+        gids: set[int] = set()
         for g in info.get("genre") or []:
             try:
                 gids.add(int(g.get("id")))
@@ -177,7 +216,7 @@ def build(api, cfg, pages):
         samples, movie = sample_info(it)
         sits = situations_of(genre_names(it), title, rules)
         solo = SOLO_ID in gids
-        work = {
+        work: Json = {
             "cid": cid, "title": title,
             "image": (img.get("large") or img.get("list") or img.get("small") or "").replace("http://", "https://"),
             "aff_url": aff, "release": d, "rc": rc, "avg": avg, "minutes": to_int(it.get("volume")),
@@ -208,9 +247,9 @@ def build(api, cfg, pages):
     return works, stats, skipped
 
 
-def actress_payload(stats, cfg):
+def actress_payload(stats: dict[str, Json], cfg: Json) -> list[Json]:
     """サイトへ送る女優データ(単体作品の多い順に上位 max_actresses 人)"""
-    out = []
+    out: list[Json] = []
     for aid, s in stats.items():
         if s["solo"] < cfg.get("min_solo_for_actress", 5):
             continue
@@ -239,9 +278,9 @@ def actress_payload(stats, cfg):
     return out[: cfg.get("max_actresses", 150)]
 
 
-def pick_works(works, cfg):
+def pick_works(works: list[Json], cfg: Json) -> list[Json]:
     """サイトへ送る作品: 直近new_days日の新作はすべて + レビュー件数の多い順で max_works 件まで"""
-    new_from = (date.today() - timedelta(days=cfg.get("new_days", 45))).isoformat()
+    new_from = (today_jst() - timedelta(days=cfg.get("new_days", 45))).isoformat()
     chosen = {w["cid"]: w for w in works if w["release"] >= new_from}
     for w in sorted(works, key=lambda w: w["rc"], reverse=True):
         if len(chosen) >= cfg.get("max_works", 300):
@@ -250,16 +289,16 @@ def pick_works(works, cfg):
     return list(chosen.values())
 
 
-def actress_profile(api, aid):
+def actress_profile(api: Api, aid: str) -> Json:
     """女優の写真URLとプロフィール(身長・カップ・3サイズ)。取れなくても全体は止めない"""
     try:
         res = api.get("ActressSearch", actress_id=aid, hits=1)
-    except Exception as e:  # noqa: BLE001
+    except (requests.RequestException, RuntimeError, ValueError) as e:
         print("profile skipped (%s): %s" % (aid, e))
         return {}
     for a in res.get("actress") or []:
         img = a.get("imageURL") or {}
-        out = {}
+        out: Json = {}
         photo = (img.get("large") or img.get("small") or "").replace("http://", "https://")
         if photo:
             out["image"] = photo
@@ -274,18 +313,41 @@ def actress_profile(api, aid):
     return {}
 
 
-def post(site, token, path, key, items, size, extra=None):
+def post(session: requests.Session, site: str, token: str, path: str, key: str,
+         items: list[Json], size: int, extra: Json | None = None) -> None:
     for i in range(0, len(items), size):
-        r = requests.post(
+        r = session.post(
             "%s/wp-json/navi/v1/%s" % (site.rstrip("/"), path),
             json={**(extra or {}), key: items[i:i + size]},
-            headers={"X-Navi-Token": token, "User-Agent": UA}, timeout=120,
+            headers={"X-Navi-Token": token}, timeout=120,
         )
         print(path, r.status_code, r.text[:200])
         r.raise_for_status()
 
 
-def main(argv=None):
+def write_summary(lines: list[str]) -> None:
+    """GitHub Actionsの実行結果画面に、件数と最新の発売日を表示する(更新が止まっていないか一目で分かる)"""
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as e:
+        print("summary skipped: %s" % e)
+
+
+def write_csv(path: str, actresses: list[Json]) -> None:
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["女優ID", "女優名", "NTR作品数", "直近1年", "単体作品数", "誘う側タグ率(%)", "人妻不倫タグ率(%)",
+                    "レビュー平均", "レビュー総数", "最新作", "代表作(レビュー最多)"])
+        for a in actresses:
+            w.writerow([a["aid"], a["name"], a["ntr_works"], a["recent"], a["solo"], a["aggr_pct"], a["wife_pct"],
+                        a["review_avg"], a["review_n"], a["latest"], a["top_title"]])
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="navi_config.json")
     ap.add_argument("--pages", type=int, help="取得ページ数(1ページ100件)。省略時は設定ファイルの値")
@@ -296,7 +358,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     with open(args.config, encoding="utf-8") as f:
-        cfg = json.load(f)
+        cfg: Json = json.load(f)
     api = Api(env("DMM_API_ID"), env("DMM_AFFILIATE_ID"))
 
     if args.list_genres:
@@ -307,37 +369,52 @@ def main(argv=None):
                     if (s.get("code"), sv.get("code"), fl.get("code")) == (cfg.get("site", "FANZA"), cfg["service"], cfg["floor"]):
                         for g in api.get("GenreSearch", floor_id=fl["id"], hits=500).get("genre", []):
                             print("%s\t%s" % (g["genre_id"], g["name"]))
-                        return
-        sys.exit("フロアが見つかりません")
+                        return 0
+        print("フロアが見つかりません", file=sys.stderr)
+        return 1
 
     works, stats, skipped = build(api, cfg, args.pages or cfg.get("pages", 30))
+    if not works:
+        # 認証切れ・ジャンルID変更などで0件になった時に、「成功したのに更新されない」状態を作らない
+        print("ERROR: 対象作品が0件でした。APIキー・ジャンルID・期間設定を確認してください(サイトへは送信しません)", file=sys.stderr)
+        return 1
+
     sends = pick_works(works, cfg)
     actresses = actress_payload(stats, cfg)
     sit_count = Counter(k for w in sends for k in w["situations"])
-    print("対象作品 %d件(除外 %d / 期間外・不備 %d) → 送る作品 %d件 / 送る女優 %d人" % (
-        len(works), skipped["excluded"], skipped["date"] + skipped["incomplete"], len(sends), len(actresses)))
+    latest_release = max(w["release"] for w in works)
+    head = "対象作品 %d件(除外 %d / 期間外・不備 %d) → 送る作品 %d件 / 送る女優 %d人" % (
+        len(works), skipped["excluded"], skipped["date"] + skipped["incomplete"], len(sends), len(actresses))
+    print(head)
+    print("最新の発売日: %s(実行日 %s JST)" % (latest_release, today_jst().isoformat()))
     print("シチュエーション別:", dict(sit_count))
 
     if args.csv:
-        with open(args.csv, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            w.writerow(["女優ID", "女優名", "NTR作品数", "直近1年", "単体作品数", "誘う側タグ率(%)", "人妻不倫タグ率(%)",
-                        "レビュー平均", "レビュー総数", "最新作", "代表作(レビュー最多)"])
-            for a in actresses:
-                w.writerow([a["aid"], a["name"], a["ntr_works"], a["recent"], a["solo"], a["aggr_pct"], a["wife_pct"],
-                            a["review_avg"], a["review_n"], a["latest"], a["top_title"]])
+        write_csv(args.csv, actresses)
 
     if args.dry_run:
         print(json.dumps(sends[:2], ensure_ascii=False, indent=2))
-        return
+        return 0
 
     site, token = env("NAVI_SITE_URL"), env("NAVI_API_TOKEN")
-    post(site, token, "works-upsert", "items", sends, 50)
+    session = make_session()
+    post(session, site, token, "works-upsert", "items", sends, 50)
     if not args.no_photos:
         for a in actresses:
             a.update(actress_profile(api, a["aid"]))
-    post(site, token, "actress-upsert", "items", actresses, 20, {"period_months": cfg["months"]})
+    post(session, site, token, "actress-upsert", "items", actresses, 20, {"period_months": cfg["months"]})
+    write_summary(["### navi-sync 完了", "- " + head, "- 最新の発売日: %s" % latest_release])
+    return 0
+
+
+def run() -> int:
+    try:
+        return main()
+    except (requests.RequestException, RuntimeError, ValueError, OSError) as e:
+        # スタックトレースではなく原因が分かる1行を出し、非ゼロで終了してActionsを失敗扱いにする
+        print("ERROR: %s: %s" % (type(e).__name__, e), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(run())
